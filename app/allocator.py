@@ -82,10 +82,13 @@ def _subtract_ranges(
     remaining: list[tuple[int, int]] = []
     cursor = p_start
     for raw_start, raw_end in sorted(blocked):
-        start = max(raw_start, p_start)
-        end = min(raw_end, p_end)
-        if end < cursor:
+        # 完全落在游标之前（已处理）或父区间之后：跳过/结束。
+        if raw_end < cursor:
             continue
+        if raw_start > p_end:
+            break
+        start = max(raw_start, cursor)
+        end = min(raw_end, p_end)
         if start > cursor:
             remaining.append((cursor, start - 1))
         cursor = max(cursor, end + 1)

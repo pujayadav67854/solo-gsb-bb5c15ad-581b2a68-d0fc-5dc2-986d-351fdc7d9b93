@@ -1,4 +1,4 @@
-"""FastAPI 接口：池状态查询、预演与原子提交、部分回收与保留区替换。"""
+"""FastAPI 接口：池状态查询、预演与原子提交、部分回收、整批迁移与保留区替换。"""
 from __future__ import annotations
 
 import ipaddress
@@ -10,7 +10,13 @@ from pydantic import BaseModel, Field, field_validator
 
 from .allocator import CidrAllocationSolver, InfeasibleError
 from .config import settings
-from .db import ConflictError, Database, PoolState, ReservationInputError
+from .db import (
+    ConflictError,
+    Database,
+    PoolState,
+    RelocateInputError,
+    ReservationInputError,
+)
 
 _db: Database | None = None
 
@@ -134,6 +140,79 @@ class ReclaimResponse(BaseModel):
     status: Literal["reclaimed"]
     pool_version: int
     reclaimed_cidr: str
+    allocated_cidrs: list[str]
+    free_cidrs: list[str]
+
+
+class RelocateItem(BaseModel):
+    from_cidr: str = Field(
+        ...,
+        description=(
+            "迁移来源规范 CIDR，必须完全由当前已分配地址覆盖，"
+            "可跨越相邻的多条分配记录。"
+        ),
+    )
+    to_cidr: str = Field(
+        ...,
+        description=(
+            "迁移目标规范 CIDR，与来源地址族、前缀长度相同；必须落在"
+            "父网段内，可使用本批来源释放的地址，但不得触及保留区或"
+            "未迁移的已分配地址。"
+        ),
+    )
+
+    @field_validator("from_cidr", "to_cidr")
+    @classmethod
+    def _validate_cidr(cls, raw: str) -> str:
+        # strict=True：主机位非零的非对齐写法直接 422，不静默改写成网络地址。
+        return str(ipaddress.ip_network(raw, strict=True))
+
+
+class RelocateRequest(BaseModel):
+    pool_version: int = Field(..., ge=1, description="当前池版本号。")
+    moves: list[RelocateItem] = Field(
+        ...,
+        min_length=1,
+        max_length=8,
+        description="整批同时迁移的 1～8 组 from_cidr/to_cidr。",
+    )
+
+    @field_validator("moves")
+    @classmethod
+    def _validate_moves(
+        cls, items: list[RelocateItem]
+    ) -> list[RelocateItem]:
+        parsed = [
+            (
+                ipaddress.ip_network(item.from_cidr, strict=True),
+                ipaddress.ip_network(item.to_cidr, strict=True),
+            )
+            for item in items
+        ]
+        # 同组两端：地址族与前缀长度必须一致。
+        for src, dst in parsed:
+            if src.version != dst.version or src.prefixlen != dst.prefixlen:
+                raise ValueError(
+                    "from_cidr and to_cidr must share the same address "
+                    "family and prefix length"
+                )
+        # 各来源之间、各目标之间不得重叠（来源与来源允许相邻；目标
+        # 之间同样允许相邻——重写时会合并）。
+        for label, nets in (
+            ("from_cidr", [src for src, _ in parsed]),
+            ("to_cidr", [dst for _, dst in parsed]),
+        ):
+            ordered = sorted(nets, key=lambda n: int(n.network_address))
+            for a, b in zip(ordered, ordered[1:]):
+                if a.overlaps(b):
+                    raise ValueError(f"{label} values contain overlapping CIDRs")
+        return items
+
+
+class RelocateResponse(BaseModel):
+    status: Literal["relocated"]
+    pool_version: int
+    moves: list[RelocateItem]
     allocated_cidrs: list[str]
     free_cidrs: list[str]
 
@@ -313,5 +392,49 @@ def reclaim(
         pool_version=state.version,
         reclaimed_cidr=str(target),
         allocated_cidrs=[str(n) for n in allocated_after],
+        free_cidrs=[str(n) for n in free],
+    )
+
+
+@app.post(
+    "/api/allocations/relocate",
+    response_model=RelocateResponse,
+    tags=["allocations"],
+)
+def relocate(
+    body: RelocateRequest, db: Database = Depends(get_db)
+) -> RelocateResponse:
+    """整批同时迁移：把 1～8 段已分配地址从 from_cidr 搬到 to_cidr。
+
+    每组两端须为规范 CIDR、地址族与前缀长度相同；各来源之间、各目标
+    之间不得重叠。每个来源必须被当前已分配地址完整覆盖（可跨越相邻
+    多条记录，也可只覆盖一条记录的一部分）；目标必须在父网段内，可
+    使用本批来源释放的地址（允许来源与目标相同），但不得触及保留区
+    或未迁移的已分配地址。
+
+    按**整批同时迁移**的结果（当前已分配地址减去全部来源，再并入
+    全部目标），把已分配地址全局合并并重写为最少的规范 CIDR。版本
+    检查、覆盖与冲突复核、重写及版本自增在单个 SQLite 写事务内完成，
+    任何一步失败即整体回滚，返回 409 且池与版本不变。
+    """
+    moves = tuple(
+        (
+            ipaddress.ip_network(item.from_cidr, strict=True),
+            ipaddress.ip_network(item.to_cidr, strict=True),
+        )
+        for item in body.moves
+    )
+    try:
+        state = db.relocate_allocations(body.pool_version, moves)
+    except RelocateInputError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    free, _ = _free_cidrs(state)
+    return RelocateResponse(
+        status="relocated",
+        pool_version=state.version,
+        moves=body.moves,
+        allocated_cidrs=[str(n) for n in state.allocated],
         free_cidrs=[str(n) for n in free],
     )
