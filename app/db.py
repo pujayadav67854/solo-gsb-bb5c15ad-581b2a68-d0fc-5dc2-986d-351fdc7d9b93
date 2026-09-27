@@ -366,6 +366,164 @@ class Database:
                 raise ConflictError(f"reclaim failed: {exc}") from exc
         return state, tuple(state.allocated)
 
+    # -- 已分配地址的整批迁移 ---------------------------------------------
+
+    def relocate_allocations(
+        self,
+        expected_version: int,
+        moves: tuple[tuple[ipaddress._BaseNetwork, ipaddress._BaseNetwork], ...],
+    ) -> PoolState:
+        """把 1～8 组 (来源, 目标) CIDR 作为**同一批**同时迁移。
+
+        每组的两端已在接口层保证为规范 CIDR、同族且前缀长度相同；来源
+        之间、目标之间分别互不相交。在单条 ``BEGIN IMMEDIATE`` 事务内
+        完成：版本检查、父网段归属校验、与保留区/已分配地址的覆盖与
+        冲突复核、已分配集重写、版本自增。任何一步失败即整体回滚，
+        地址池与版本均不变。
+
+        按“整批同时迁移”计算：目标允许使用本批来源释放出的地址
+        （允许来源与目标交叉、相互交换），但不得触及保留区或未被本批
+        来源释放的已分配地址。迁移后把剩余已分配地址与目标地址全局
+        合并相邻区间，重写为**最少**的规范 CIDR 再落库。返回写事务内
+        读取的新状态。
+        """
+
+        def _intersects(
+            target: tuple[int, int], ranges: list[tuple[int, int]]
+        ) -> bool:
+            t_start, t_end = target
+            return any(t_start <= r_end and r_start <= t_end
+                       for r_start, r_end in ranges)
+
+        source_nets = [pair[0] for pair in moves]
+        target_nets = [pair[1] for pair in moves]
+        with self._conn() as conn:
+            try:
+                # 立即获取写锁，与并发提交/回收/替换/迁移互斥。
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT parent_cidr, version FROM pool_meta WHERE id = 1"
+                ).fetchone()
+                current_version = row["version"]
+                if current_version != expected_version:
+                    conn.rollback()
+                    raise ConflictError(
+                        f"pool version changed: expected {expected_version}, "
+                        f"current {current_version}"
+                    )
+
+                parent = ipaddress.ip_network(row["parent_cidr"], strict=True)
+
+                rows = conn.execute(
+                    "SELECT cidr, kind FROM subnets"
+                ).fetchall()
+                reserved = [
+                    ipaddress.ip_network(r["cidr"], strict=True)
+                    for r in rows
+                    if r["kind"] == "reserved"
+                ]
+                allocated = [
+                    ipaddress.ip_network(r["cidr"], strict=True)
+                    for r in rows
+                    if r["kind"] == "allocated"
+                ]
+
+                # 父网段归属：来源与目标都必须同族且完全落在父网段内。
+                for net in source_nets + target_nets:
+                    if net.version != parent.version or not net.subnet_of(
+                        parent
+                    ):
+                        conn.rollback()
+                        raise ConflictError(
+                            f"relocation CIDR {net} is outside of pool {parent}"
+                        )
+
+                reserved_ranges = _collapse_ranges(
+                    [_network_bounds(net) for net in reserved]
+                )
+                allocated_ranges = _collapse_ranges(
+                    [_network_bounds(net) for net in allocated]
+                )
+                # 来源在接口层已保证互不相交，_collapse_ranges 仅作规整。
+                source_ranges = _collapse_ranges(
+                    [_network_bounds(net) for net in source_nets]
+                )
+
+                # 目标不得触及保留区。
+                for net in target_nets:
+                    if _intersects(_network_bounds(net), reserved_ranges):
+                        conn.rollback()
+                        raise ConflictError(
+                            f"relocation target {net} overlaps reserved address"
+                        )
+
+                # 每个来源必须被当前已分配地址完整覆盖（含保留地址或未
+                # 分配地址都会在此暴露：已分配集不可能包含保留地址）。
+                uncovered: list[tuple[int, int]] = []
+                for source_range in source_ranges:
+                    uncovered.extend(
+                        _subtract_ranges(source_range, allocated_ranges)
+                    )
+                if uncovered:
+                    conn.rollback()
+                    raise ConflictError(
+                        "relocation source is not fully covered by allocated "
+                        "addresses"
+                    )
+
+                # 整批同时释放：从当前已分配合并区间中扣除全部来源区间，
+                # 得到“未迁移的已分配地址”。
+                remaining_ranges: list[tuple[int, int]] = []
+                for allocated_range in allocated_ranges:
+                    remaining_ranges.extend(
+                        _subtract_ranges(allocated_range, source_ranges)
+                    )
+                remaining_ranges = _collapse_ranges(remaining_ranges)
+
+                # 目标不得触及未迁移的已分配地址；落在本批来源释放区
+                # （包括另一组来源本身、交叉交换）则允许。
+                for net in target_nets:
+                    if _intersects(_network_bounds(net), remaining_ranges):
+                        conn.rollback()
+                        raise ConflictError(
+                            f"relocation target {net} overlaps allocated "
+                            f"addresses not released by this batch"
+                        )
+
+                # 剩余已分配地址 ∪ 目标地址全局合并相邻区间，重写为最少
+                # 规范 CIDR；目标在接口层已保证互不相交。
+                new_ranges = _collapse_ranges(
+                    remaining_ranges
+                    + [_network_bounds(net) for net in target_nets]
+                )
+                new_allocated = [
+                    ipaddress.ip_network((s, p), strict=True)
+                    for s, p in _ranges_to_cidrs(
+                        parent.max_prefixlen, new_ranges
+                    )
+                ]
+
+                # 重写已分配子网：删除全部 allocated 行后写回规范化结果。
+                conn.execute("DELETE FROM subnets WHERE kind = 'allocated'")
+                conn.executemany(
+                    "INSERT INTO subnets (cidr, kind) "
+                    "VALUES (?, 'allocated')",
+                    [(str(net),) for net in new_allocated],
+                )
+                conn.execute(
+                    "UPDATE pool_meta SET version = version + 1 WHERE id = 1"
+                )
+                # 与提交/回收相同：在同一写事务内读取迁移后的状态。
+                state = self._load_state(conn)
+                conn.commit()
+                self._after_commit(conn)
+            except ConflictError:
+                raise
+            except sqlite3.Error as exc:
+                conn.rollback()
+                raise ConflictError(f"relocate failed: {exc}") from exc
+        return state
+
     # -- 保留子网的整体替换 -------------------------------------------------
 
     def replace_reservations(

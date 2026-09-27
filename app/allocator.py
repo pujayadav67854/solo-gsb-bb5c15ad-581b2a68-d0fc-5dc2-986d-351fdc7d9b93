@@ -82,8 +82,16 @@ def _subtract_ranges(
     remaining: list[tuple[int, int]] = []
     cursor = p_start
     for raw_start, raw_end in sorted(blocked):
+        # 区间完全位于父区间之后：后续区间起点更大，无需再看。
+        if raw_start > p_end:
+            break
+        # 区间完全位于父区间之前：跳过，不推进光标。
+        if raw_end < p_start:
+            continue
         start = max(raw_start, p_start)
         end = min(raw_end, p_end)
+        # 与父区间重叠但完全落在光标之前（含恰好在光标左侧相邻）：
+        # 没有可扣除的地址，也不产生空区间。
         if end < cursor:
             continue
         if start > cursor:

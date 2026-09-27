@@ -13,6 +13,8 @@
 
 保留区替换接口把**保留地址整体替换**为目标集合：传入池版本与 `desired_cidrs`（允许空列表、重叠与相邻网段），在单条写事务内规范化为**覆盖范围相同且数量最少**的规范 CIDR、重写全部保留记录并自增版本。目标范围与已分配地址相交或版本过期时返回 `409 Conflict` 且**地址池保持不变**；非规范、越出父网段或地址族不一致的输入返回 `422 Unprocessable Entity`。
 
+整批迁移接口把 **1～8 组已分配地址同时迁移**：每组传入 `from_cidr` / `to_cidr`，两端须为规范 CIDR、地址族与前缀长度相同；各来源之间、各目标之间不得重叠。每个来源必须被当前已分配地址完整覆盖；目标须在父网段内，**可使用本批来源释放出的地址**（允许来源与目标交叉、相互交换），但不得触及保留区或未迁移的已分配地址。版本检查、覆盖与冲突复核、已分配集重写与版本自增在**同一条 SQLite 写事务**内完成，按整批同时迁移的结果把剩余已分配地址与目标地址合并并重写为**最少的规范 CIDR**。冲突返回 `409 Conflict` 且**池与版本不变**，非法输入返回 `422 Unprocessable Entity`。
+
 ---
 
 ## 一条命令启动
@@ -72,6 +74,7 @@ docker compose down -v         # 同时删除数据卷（彻底重置）
 | POST | `/api/allocations/preview` | **预演**：不修改状态，返回池版本与最优方案 |
 | POST | `/api/allocations/commit` | **提交**：携带版本与方案，原子落库或返回 409 |
 | POST | `/api/allocations/reclaim` | **部分回收**：回收完全被已分配地址覆盖的规范 CIDR |
+| POST | `/api/allocations/relocate` | **整批迁移**：1～8 组 from/to 同时迁移，重写为最少 CIDR |
 | POST | `/api/pool/reservations/replace` | **替换保留区**：以目标集合整体重写保留子网（规范化为最少 CIDR） |
 
 ### 1. 查询池状态
@@ -233,6 +236,61 @@ curl -X POST http://localhost:8000/api/pool/reservations/replace \
 
 输入非法时返回 `422 Unprocessable Entity`：CIDR 写法非规范（如主机位非零的 `10.0.0.1/24`）、无法解析、越出父网段（含父网段的超网）或地址族与父网段不一致。
 
+### 6. 整批迁移已分配地址（同时迁移，原子）
+
+把当前池版本与 **1～8 组** `from_cidr` / `to_cidr` 提交到迁移接口，整批作为**同时发生**处理：每个来源在同一时刻释放，因此目标可以落在**本批来源释放出的地址**上（包括来源与目标交叉、两组地址相互交换），但不能触及保留区或**未被本批来源释放**的已分配地址。
+
+每组两端必须是规范 CIDR、**地址族相同且前缀长度相同**；各来源之间、各目标之间均不得重叠。迁移后系统会把剩余已分配地址与全部目标地址全局合并相邻区间，重写为**数量最少**的规范 CIDR。
+
+```bash
+curl -X POST http://localhost:8000/api/allocations/relocate \
+  -H 'Content-Type: application/json' \
+  -d '{"pool_version": 6,
+       "moves": [
+         {"from_cidr": "10.1.0.0/24", "to_cidr": "10.2.0.0/24"},
+         {"from_cidr": "10.1.1.0/24", "to_cidr": "10.2.1.0/24"}
+       ]}'
+```
+
+来源与目标相互交换（整批同时迁移才成立）同样合法：
+
+```bash
+curl -X POST http://localhost:8000/api/allocations/relocate \
+  -H 'Content-Type: application/json' \
+  -d '{"pool_version": 6,
+       "moves": [
+         {"from_cidr": "10.1.0.0/25", "to_cidr": "10.1.0.128/25"},
+         {"from_cidr": "10.1.0.128/25", "to_cidr": "10.1.0.0/25"}
+       ]}'
+```
+
+成功（在单个 SQLite 写事务内复核、重写已分配集、版本自增）：
+
+```json
+{
+  "status": "relocated",
+  "pool_version": 7,
+  "allocated_cidrs": ["10.1.0.0/24", "..."],
+  "free_cidrs": ["..."]
+}
+```
+
+- `allocated_cidrs`：迁移后的全部已分配地址，已把剩余已分配地址与目标地址全局合并并重写为**数量最少**的规范 CIDR（相邻目标会合并，如两个相邻 `/25` 合成 `/24`）；
+- `free_cidrs`：迁移后的当前空闲 CIDR，迁出释放的空间立即可用；
+- `pool_version`：自增后的新版本，后续预演/提交/回收/迁移均以此为准。
+
+失败时返回 `409 Conflict`，响应体 `detail` 说明原因，**数据库不发生任何写入（池与版本均不变）**：
+
+- `pool_version` 已过期（被其它提交/回收/迁移改变，乐观并发控制）；
+- 任一来源或目标越出父网段（含地址族与父网段不一致）；
+- 目标与保留子网重叠；
+- 来源未被当前已分配地址**完整覆盖**（含未分配地址，包括已分配集为空时的迁移）；
+- 目标触及**未被本批来源释放**的已分配地址（落在另一组来源本身则允许）。
+
+输入非法时返回 `422 Unprocessable Entity`：CIDR 写法非规范（如主机位非零的 `10.1.0.1/24`）或无法解析、同组两端地址族或前缀长度不同、来源之间重叠、目标之间重叠、`moves` 为空或超过 8 组。
+
+> 来源与目标相同的空操作是合法的（仍会自增版本）。迁移不要求来源与既有分配记录的边界对齐，但来源本身必须是规范 CIDR 且被已分配地址完整覆盖。
+
 ---
 
 ## 正确性与并发保证
@@ -264,6 +322,13 @@ curl -X POST http://localhost:8000/api/pool/reservations/replace \
   提交/回收/替换之间由写锁互斥，同一版本并发写时**恰有一个**成功。替换
   响应中的保留/空闲 CIDR 同样在本写事务内部读取，提交后的 `GET /api/pool`
   与预演立即基于新版本与新保留区计算。
+- 整批迁移接口同样使用 `BEGIN IMMEDIATE` 单事务：版本检查 → 父网段归属 /
+  保留区 / 来源覆盖 / 目标冲突（按“整批同时释放”后剩余的已分配地址）
+  复核 → 扣除全部来源并把剩余已分配地址与目标地址合并为最少规范 CIDR →
+  删除重写已分配集 → 版本自增。任一环节失败立即回滚，池状态与版本均不变；
+  迁移与并发提交/回收/替换/迁移之间由写锁互斥，同一版本并发写时**恰有一个**
+  成功。迁移响应中的已分配/空闲 CIDR 同样在本写事务内部读取，提交后的
+  `GET /api/pool` 与预演立即基于新版本与迁移后的占用集计算。
 
 ---
 
@@ -281,6 +346,7 @@ DB_PATH=./cidr_pool.db PARENT_CIDR=10.0.0.0/16 \
 python3 -m tests.test_allocator_bruteforce   # 4000 组 IPv4 暴力对照
 python3 -m tests.test_api                    # 接口端到端 + 冲突/原子性
 python3 -m tests.test_reclaim                # 部分回收端到端：跨记录/重写/冲突
+python3 -m tests.test_relocate               # 整批迁移端到端：同时迁移/重写/冲突
 python3 -m tests.test_reservations_replace   # 保留区整体替换：规范化/冲突/并发
 python3 -m tests.test_concurrency            # 并发交错回归：快照读取与提交响应绑定
 ```
@@ -298,6 +364,7 @@ tests/
   test_dense_reserved.py
   test_api.py
   test_reclaim.py
+  test_relocate.py
   test_reservations_replace.py
   test_concurrency.py
 Dockerfile
